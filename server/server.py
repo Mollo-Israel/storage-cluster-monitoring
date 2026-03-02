@@ -3,23 +3,28 @@ import threading
 import json
 import struct
 import time
-from datetime import datetime
 
 HOST = "0.0.0.0"
 PORT = 5000
 MAX_CLIENTS = 9
-BUFFER_SIZE = 4096
-CLIENT_TIMEOUT = 30  # segundos sin reportar
+CLIENT_TIMEOUT = 30  # segundos sin reportar (por disco)
+MONITOR_INTERVAL = 5
 
+# Estructura:
+# clients = {
+#   node_id: {
+#       "addr": addr,
+#       "disks": {
+#           disk_name: {"data": message, "last_seen": time.time()}
+#       }
+#   }
+# }
 clients = {}
 clients_lock = threading.Lock()
 
 
-# ==============================
-# Función para recibir exactamente N bytes
-# ==============================
 def recv_exact(sock, size):
-    data = b''
+    data = b""
     while len(data) < size:
         packet = sock.recv(size - len(data))
         if not packet:
@@ -28,33 +33,26 @@ def recv_exact(sock, size):
     return data
 
 
-# ==============================
-# Validación mínima de métricas
-# ==============================
 def validate_metrics(data):
-    required_fields = [
-        "node_id",
-        "disk_name",
-        "total_gb",
-        "used_gb",
-        "free_gb",
-        "timestamp"
-    ]
-
+    required_fields = ["node_id", "disk_name", "total_gb", "used_gb", "free_gb", "timestamp"]
     return all(field in data for field in required_fields)
 
 
-# ==============================
-# Manejo de cada cliente
-# ==============================
+def send_json(sock, data):
+    try:
+        encoded = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        msg = struct.pack(">I", len(encoded)) + encoded
+        sock.sendall(msg)
+    except Exception:
+        pass
+
+
 def handle_client(conn, addr):
     print(f"[+] Cliente conectado: {addr}")
-
     conn.settimeout(CLIENT_TIMEOUT)
 
     try:
         while True:
-            # Leer tamaño del mensaje (4 bytes)
             raw_msglen = recv_exact(conn, 4)
             if not raw_msglen:
                 print(f"[-] Cliente {addr} desconectado")
@@ -62,37 +60,38 @@ def handle_client(conn, addr):
 
             msglen = struct.unpack(">I", raw_msglen)[0]
 
-            # Leer mensaje completo
             data = recv_exact(conn, msglen)
             if not data:
                 print(f"[-] Cliente {addr} desconectado")
                 break
 
             try:
-                message = json.loads(data.decode())
+                message = json.loads(data.decode("utf-8"))
             except json.JSONDecodeError:
                 print(f"[!] JSON inválido desde {addr}")
-                continue  # no tumba el servidor
+                continue
 
             if not validate_metrics(message):
                 print(f"[!] Estructura inválida desde {addr}")
                 continue
 
-            node_id = message["node_id"]
+            node_id = str(message["node_id"])
+            disk_name = str(message["disk_name"])
 
-            # Guardar última métrica recibida
             with clients_lock:
-                clients[node_id] = {
+                if node_id not in clients:
+                    clients[node_id] = {"addr": addr, "disks": {}}
+
+                clients[node_id]["addr"] = addr
+                clients[node_id]["disks"][disk_name] = {
                     "data": message,
                     "last_seen": time.time(),
-                    "addr": addr
                 }
 
-            print(f"\n📥 Métrica recibida de {node_id}")
-            print(json.dumps(message, indent=2))
+            print(f"\n📥 Métrica recibida de {node_id} | Disco: {disk_name}")
+            print(json.dumps(message, indent=2, ensure_ascii=False))
 
-            # Enviar ACK
-            ack = {"status": "OK", "message": "Métrica recibida"}
+            ack = {"status": "OK", "message": "Métrica recibida", "node_id": node_id, "disk_name": disk_name}
             send_json(conn, ack)
 
     except socket.timeout:
@@ -106,36 +105,25 @@ def handle_client(conn, addr):
         print(f"[x] Conexión cerrada {addr}")
 
 
-# ==============================
-# Enviar JSON seguro
-# ==============================
-def send_json(sock, data):
-    try:
-        encoded = json.dumps(data).encode()
-        msg = struct.pack(">I", len(encoded)) + encoded
-        sock.sendall(msg)
-    except:
-        pass
-
-
-# ==============================
-# Monitor de nodos inactivos
-# ==============================
 def monitor_nodes():
     while True:
-        time.sleep(5)
+        time.sleep(MONITOR_INTERVAL)
         now = time.time()
 
         with clients_lock:
             for node_id in list(clients.keys()):
-                if now - clients[node_id]["last_seen"] > CLIENT_TIMEOUT:
-                    print(f"⚠ Nodo {node_id} NO REPORTA")
+                disks = clients[node_id].get("disks", {})
+                for disk_name in list(disks.keys()):
+                    last_seen = disks[disk_name]["last_seen"]
+                    if now - last_seen > CLIENT_TIMEOUT:
+                        print(f"⚠ Nodo {node_id} | Disco {disk_name} NO REPORTA (timeout)")
+                        del disks[disk_name]
+
+                # Si ya no tiene discos activos, borrar el nodo
+                if not disks:
                     del clients[node_id]
 
 
-# ==============================
-# Servidor principal
-# ==============================
 def start_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -150,17 +138,15 @@ def start_server():
         while True:
             conn, addr = server.accept()
 
+            # Este check es "best effort": cuenta nodos que ya reportaron al menos una vez.
+            # (Si quieres un control perfecto por conexión activa, se hace con otro set.)
             with clients_lock:
                 if len(clients) >= MAX_CLIENTS:
-                    print("❌ Máximo de clientes alcanzado")
+                    print("❌ Máximo de clientes alcanzado (por node_id)")
                     conn.close()
                     continue
 
-            thread = threading.Thread(
-                target=handle_client,
-                args=(conn, addr),
-                daemon=True
-            )
+            thread = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
             thread.start()
 
     except KeyboardInterrupt:

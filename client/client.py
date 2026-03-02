@@ -3,94 +3,141 @@ import socket
 import json
 import random
 import time
+import struct
 from datetime import datetime, timezone
 
 import psutil
 
 
-# -----------------------
-# ARGUMENTOS
-# -----------------------
 def parse_args():
     parser = argparse.ArgumentParser(description="Cliente TCP - métricas + envío periódico")
-    parser.add_argument("--client-id", required=True, help="ID del cliente (ej: 1..9)")
+    parser.add_argument("--client-id", required=True, help="ID del cliente (ej: LPZ, ORU, 1..9)")
     parser.add_argument("--server-ip", required=True, help="IP o hostname del servidor central")
     parser.add_argument("--interval", type=int, default=5, help="Intervalo de envío (segundos)")
-    parser.add_argument("--server-port", type=int, default=9000, help="Puerto TCP del servidor (default: 9000)")
+    parser.add_argument("--server-port", type=int, default=5000, help="Puerto TCP del servidor (default: 5000)")
     return parser.parse_args()
 
 
-# -----------------------
-# UTIL
-# -----------------------
 def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 def bytes_to_gb(b: int) -> float:
-    gb = b / (1024 ** 3)
-    return round(float(gb), 2)
+    return round(float(b / (1024 ** 3)), 2)
 
 
-# -----------------------
-# MÉTRICAS
-# -----------------------
-def detect_first_disk():
+def list_all_disks():
+    """
+    Devuelve una lista de discos/particiones "reales" con uso.
+    Filtra FS típicos "virtuales" para evitar ruido.
+    """
     partitions = psutil.disk_partitions(all=False)
     if not partitions:
-        return None
+        return []
 
-    ignore_fs = {"tmpfs", "devtmpfs", "squashfs", "overlay", "proc", "sysfs", "cgroup"}
+    ignore_fs = {"tmpfs", "devtmpfs", "squashfs", "overlay", "proc", "sysfs", "cgroup", "cgroup2", "autofs"}
+
+    disks = []
+    seen = set()
 
     for p in partitions:
         fstype = (p.fstype or "").lower()
         if fstype in ignore_fs:
             continue
 
+        mount = p.mountpoint
+        device = p.device
+
+        # Evitar duplicados por seguridad
+        key = (device, mount)
+        if key in seen:
+            continue
+        seen.add(key)
+
         try:
-            usage = psutil.disk_usage(p.mountpoint)
-        except PermissionError:
+            usage = psutil.disk_usage(mount)
+        except (PermissionError, FileNotFoundError, OSError):
             continue
 
-        return {
-            "name": p.device,
-            "mountpoint": p.mountpoint,
+        disks.append({
+            "disk_name": device,            # <- lo que el server espera
+            "mountpoint": mount,
             "total_gb": bytes_to_gb(usage.total),
             "used_gb": bytes_to_gb(usage.used),
             "free_gb": bytes_to_gb(usage.free),
             "percent": round(float(usage.percent), 2),
-        }
+        })
 
-    # fallback si todo fue ignorado
-    p = partitions[0]
-    usage = psutil.disk_usage(p.mountpoint)
-    return {
-        "name": p.device,
-        "mountpoint": p.mountpoint,
-        "total_gb": bytes_to_gb(usage.total),
-        "used_gb": bytes_to_gb(usage.used),
-        "free_gb": bytes_to_gb(usage.free),
-        "percent": round(float(usage.percent), 2),
-    }
+    return disks
 
 
 def simulate_iops():
     return random.randint(50, 500)
 
 
-def build_metrics_payload(client_id: str):
-    return {
-        "type": "metrics",
-        "client_id": str(client_id),
-        "timestamp": now_iso(),
-        "disk": detect_first_disk(),
-        "iops": simulate_iops(),
-    }
+# --- Protocolo: 4 bytes (len) + JSON (igual al server) ---
+def send_json_lenpref(sock: socket.socket, payload: dict) -> None:
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    msg = struct.pack(">I", len(encoded)) + encoded
+    sock.sendall(msg)
 
 
-# -----------------------
-# TCP + ENVÍO DELIMITADO
-# -----------------------
+def recv_exact(sock: socket.socket, size: int):
+    data = b""
+    while len(data) < size:
+        packet = sock.recv(size - len(data))
+        if not packet:
+            return None
+        data += packet
+    return data
+
+
+def receive_json_lenpref(sock: socket.socket):
+    raw_len = recv_exact(sock, 4)
+    if not raw_len:
+        return None
+    msglen = struct.unpack(">I", raw_len)[0]
+    data = recv_exact(sock, msglen)
+    if not data:
+        return None
+    return json.loads(data.decode("utf-8"))
+
+
+def build_metrics_payloads(client_id: str):
+    disks = list_all_disks()
+
+    # Fallback mínimo para no reventar si psutil no detecta nada
+    if not disks:
+        disks = [{
+            "disk_name": "UNKNOWN",
+            "mountpoint": None,
+            "total_gb": 0,
+            "used_gb": 0,
+            "free_gb": 0,
+            "percent": 0
+        }]
+
+    ts = now_iso()
+    payloads = []
+    for d in disks:
+        payloads.append({
+            # Campos requeridos por el server
+            "node_id": str(client_id),
+            "disk_name": d["disk_name"],
+            "total_gb": d["total_gb"],
+            "used_gb": d["used_gb"],
+            "free_gb": d["free_gb"],
+            "timestamp": ts,
+
+            # Extras (no rompe; el server los ignora si no los usa)
+            "iops": simulate_iops(),
+            "mountpoint": d.get("mountpoint"),
+            "percent": d.get("percent"),
+        })
+
+    return payloads
+
+
 def connect_tcp(server_ip: str, server_port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(8)
@@ -99,17 +146,6 @@ def connect_tcp(server_ip: str, server_port: int) -> socket.socket:
     return sock
 
 
-def send_json_delimited(sock: socket.socket, payload: dict) -> None:
-    """
-    Envía JSON delimitado por salto de línea para que el server pueda separar mensajes.
-    """
-    message = json.dumps(payload, ensure_ascii=False) + "\n"
-    sock.sendall(message.encode("utf-8"))
-
-
-# -----------------------
-# LOOP + RECONEXIÓN
-# -----------------------
 def run_client(client_id: str, server_ip: str, server_port: int, interval: int):
     backoff = 1
     max_backoff = 20
@@ -124,9 +160,21 @@ def run_client(client_id: str, server_ip: str, server_port: int, interval: int):
                 backoff = 1
 
                 while True:
-                    payload = build_metrics_payload(client_id)
-                    send_json_delimited(sock, payload)
-                    print(f"📤 Enviado: {payload}")
+                    payloads = build_metrics_payloads(client_id)
+
+                    # ✅ Enviar 1 payload por disco
+                    for payload in payloads:
+                        send_json_lenpref(sock, payload)
+                        print(f"📤 Enviado: {payload}")
+
+                        # Recibir ACK (opcional)
+                        try:
+                            ack = receive_json_lenpref(sock)
+                            if ack:
+                                print(f"✅ ACK: {ack}")
+                        except Exception:
+                            pass
+
                     time.sleep(max(1, interval))
 
             except Exception as e:
@@ -147,12 +195,8 @@ def run_client(client_id: str, server_ip: str, server_port: int, interval: int):
         print("\n🛑 Cliente detenido por el usuario (Ctrl+C). Saliendo...")
 
 
-# -----------------------
-# MAIN
-# -----------------------
 def main():
     args = parse_args()
-
     if args.interval <= 0:
         raise ValueError("--interval debe ser mayor a 0")
 
