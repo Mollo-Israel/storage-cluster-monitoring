@@ -318,6 +318,7 @@ def start_server():
     print(f"🚀 Servidor escuchando en {HOST}:{PORT}")
 
     threading.Thread(target=monitor_nodes, daemon=True).start()
+    threading.Thread(target=command_console, daemon=True).start()
 
     try:
         while True:
@@ -326,8 +327,7 @@ def start_server():
             except socket.timeout:
                 continue
 
-            thread = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-            thread.start()
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
     except KeyboardInterrupt:
         print("\n🛑 Apagando servidor...")
