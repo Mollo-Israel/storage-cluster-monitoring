@@ -4,24 +4,18 @@ import json
 import struct
 import time
 
-
 HOST = "0.0.0.0"
 PORT = 5000
 MAX_CLIENTS = 9
-CLIENT_TIMEOUT = 30  # segundos sin reportar (por disco)
+CLIENT_TIMEOUT = 30
 MONITOR_INTERVAL = 5
 
-# Estructura:
-# clients = {
-#   node_id: {
-#       "addr": addr,
-#       "disks": {
-#           disk_name: {"data": message, "last_seen": time.time()}
-#       }
-#   }
-# }
 clients = {}
 clients_lock = threading.Lock()
+
+# --- NUEVO: cola de comandos por cliente ---
+command_queues = {}  # { node_id: [command_dict, ...] }
+command_lock = threading.Lock()
 
 
 def recv_exact(sock, size):
@@ -34,18 +28,89 @@ def recv_exact(sock, size):
     return data
 
 
+def send_json(sock, data):
+    encoded = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    msg = struct.pack(">I", len(encoded)) + encoded
+    sock.sendall(msg)
+
+
+def recv_json(sock):
+    raw_len = recv_exact(sock, 4)
+    if not raw_len:
+        return None
+    msglen = struct.unpack(">I", raw_len)[0]
+    data = recv_exact(sock, msglen)
+    if not data:
+        return None
+    return json.loads(data.decode("utf-8"))
+
+
 def validate_metrics(data):
     required_fields = ["node_id", "disk_name", "total_gb", "used_gb", "free_gb", "timestamp"]
     return all(field in data for field in required_fields)
 
 
-def send_json(sock, data):
-    try:
-        encoded = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        msg = struct.pack(">I", len(encoded)) + encoded
-        sock.sendall(msg)
-    except Exception:
-        pass
+def enqueue_command(node_id: str, cmd: dict):
+    with command_lock:
+        command_queues.setdefault(node_id, []).append(cmd)
+
+
+def pop_next_command(node_id: str):
+    with command_lock:
+        q = command_queues.get(node_id, [])
+        if not q:
+            return None
+        return q.pop(0)
+
+
+def command_console():
+    """
+    Permite inyectar comandos desde la consola del server para probar:
+
+    set_interval LPZ 2
+    """
+    print("🧪 Consola de comandos activa. Ejemplo: set_interval LPZ 2")
+    cmd_id_counter = 1
+
+    while True:
+        try:
+            line = input("> ").strip()
+            if not line:
+                continue
+
+            parts = line.split()
+            if len(parts) != 3:
+                print("Formato: set_interval <NODE_ID> <SEGUNDOS>")
+                continue
+
+            action_txt, node_id, value_txt = parts
+            if action_txt.lower() != "set_interval":
+                print("Acción soportada: set_interval")
+                continue
+
+            try:
+                value = int(value_txt)
+                if value <= 0:
+                    raise ValueError
+            except ValueError:
+                print("El valor debe ser entero > 0")
+                continue
+
+            cmd = {
+                "type": "COMMAND",
+                "cmd_id": str(cmd_id_counter),
+                "action": "SET_INTERVAL",
+                "value": value,
+            }
+            cmd_id_counter += 1
+
+            enqueue_command(node_id, cmd)
+            print(f"✅ Comando encolado para {node_id}: {cmd}")
+
+        except EOFError:
+            break
+        except Exception as e:
+            print(f"[ERROR consola] {e}")
 
 
 def handle_client(conn, addr):
@@ -54,26 +119,19 @@ def handle_client(conn, addr):
 
     try:
         while True:
-            raw_msglen = recv_exact(conn, 4)
-            if not raw_msglen:
+            message = recv_json(conn)
+            if not message:
                 print(f"[-] Cliente {addr} desconectado")
                 break
 
-            msglen = struct.unpack(">I", raw_msglen)[0]
-
-            data = recv_exact(conn, msglen)
-            if not data:
-                print(f"[-] Cliente {addr} desconectado")
-                break
-
-            try:
-                message = json.loads(data.decode("utf-8"))
-            except json.JSONDecodeError:
-                print(f"[!] JSON inválido desde {addr}")
+            # --- si llega ACK de comando ---
+            if isinstance(message, dict) and message.get("type") == "CMD_ACK":
+                print(f"📩 CMD_ACK recibido: {message}")
                 continue
 
+            # --- métricas normales ---
             if not validate_metrics(message):
-                print(f"[!] Estructura inválida desde {addr}")
+                print(f"[!] Estructura inválida desde {addr}: {message}")
                 continue
 
             node_id = str(message["node_id"])
@@ -82,18 +140,27 @@ def handle_client(conn, addr):
             with clients_lock:
                 if node_id not in clients:
                     clients[node_id] = {"addr": addr, "disks": {}}
-
                 clients[node_id]["addr"] = addr
-                clients[node_id]["disks"][disk_name] = {
-                    "data": message,
-                    "last_seen": time.time(),
-                }
+                clients[node_id]["disks"][disk_name] = {"data": message, "last_seen": time.time()}
 
             print(f"\n📥 Métrica recibida de {node_id} | Disco: {disk_name}")
             print(json.dumps(message, indent=2, ensure_ascii=False))
 
-            ack = {"status": "OK", "message": "Métrica recibida", "node_id": node_id, "disk_name": disk_name}
+            # ACK de métrica
+            ack = {
+                "type": "ACK",
+                "status": "OK",
+                "message": "Métrica recibida",
+                "node_id": node_id,
+                "disk_name": disk_name,
+            }
             send_json(conn, ack)
+
+            # --- NUEVO: si hay comandos pendientes para este nodo, enviarlos ---
+            cmd = pop_next_command(node_id)
+            if cmd:
+                print(f"📤 Enviando COMMAND a {node_id}: {cmd}")
+                send_json(conn, cmd)
 
     except socket.timeout:
         print(f"[!] Timeout cliente {addr}")
@@ -119,8 +186,6 @@ def monitor_nodes():
                     if now - last_seen > CLIENT_TIMEOUT:
                         print(f"⚠ Nodo {node_id} | Disco {disk_name} NO REPORTA (timeout)")
                         del disks[disk_name]
-
-                # Si ya no tiene discos activos, borrar el nodo
                 if not disks:
                     del clients[node_id]
 
@@ -131,19 +196,20 @@ def start_server():
     server.bind((HOST, PORT))
     server.listen(MAX_CLIENTS)
 
-    # Para que Ctrl+C responda mejor en Windows:
+    # Para que Ctrl+C funcione bien en Windows:
     server.settimeout(1.0)
 
     print(f"🚀 Servidor escuchando en {HOST}:{PORT}")
 
     threading.Thread(target=monitor_nodes, daemon=True).start()
+    threading.Thread(target=command_console, daemon=True).start()
 
     try:
         while True:
             try:
                 conn, addr = server.accept()
             except (socket.timeout, TimeoutError):
-                continue  # nadie se conectó en este segundo, seguir esperando
+                continue
 
             with clients_lock:
                 if len(clients) >= MAX_CLIENTS:
@@ -151,8 +217,7 @@ def start_server():
                     conn.close()
                     continue
 
-            thread = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-            thread.start()
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
     except KeyboardInterrupt:
         print("\n🛑 Apagando servidor...")
