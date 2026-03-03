@@ -4,6 +4,7 @@ import json
 import struct
 import time
 
+
 HOST = "0.0.0.0"
 PORT = 5000
 MAX_CLIENTS = 9
@@ -130,16 +131,20 @@ def start_server():
     server.bind((HOST, PORT))
     server.listen(MAX_CLIENTS)
 
+    # Para que Ctrl+C responda mejor en Windows:
+    server.settimeout(1.0)
+
     print(f"🚀 Servidor escuchando en {HOST}:{PORT}")
 
     threading.Thread(target=monitor_nodes, daemon=True).start()
 
     try:
         while True:
-            conn, addr = server.accept()
+            try:
+                conn, addr = server.accept()
+            except (socket.timeout, TimeoutError):
+                continue  # nadie se conectó en este segundo, seguir esperando
 
-            # Este check es "best effort": cuenta nodos que ya reportaron al menos una vez.
-            # (Si quieres un control perfecto por conexión activa, se hace con otro set.)
             with clients_lock:
                 if len(clients) >= MAX_CLIENTS:
                     print("❌ Máximo de clientes alcanzado (por node_id)")

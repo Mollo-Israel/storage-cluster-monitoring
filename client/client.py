@@ -6,6 +6,10 @@ import time
 import struct
 from datetime import datetime, timezone
 
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+
 import psutil
 
 
@@ -15,7 +19,40 @@ def parse_args():
     parser.add_argument("--server-ip", required=True, help="IP o hostname del servidor central")
     parser.add_argument("--interval", type=int, default=5, help="Intervalo de envío (segundos)")
     parser.add_argument("--server-port", type=int, default=5000, help="Puerto TCP del servidor (default: 5000)")
+    parser.add_argument("--ack-timeout", type=int, default=3, help="Timeout esperando ACK (segundos)")
     return parser.parse_args()
+
+
+def setup_logger():
+    """
+    Logger robusto a archivo con rotación: client/client.log
+    - No crece infinito
+    - Formato simple para auditoría real
+    """
+    logger = logging.getLogger("client_logger")
+    logger.setLevel(logging.INFO)
+
+    # Evita duplicar handlers si el módulo se recarga en el mismo proceso
+    if logger.handlers:
+        return logger
+
+    log_path = os.path.join(os.path.dirname(__file__), "client.log")
+
+    handler = RotatingFileHandler(
+        log_path,
+        maxBytes=1_000_000,   # 1 MB
+        backupCount=3,
+        encoding="utf-8",
+    )
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    return logger
 
 
 def now_iso():
@@ -48,7 +85,6 @@ def list_all_disks():
         mount = p.mountpoint
         device = p.device
 
-        # Evitar duplicados por seguridad
         key = (device, mount)
         if key in seen:
             continue
@@ -121,7 +157,6 @@ def build_metrics_payloads(client_id: str):
     payloads = []
     for d in disks:
         payloads.append({
-            # Campos requeridos por el server
             "node_id": str(client_id),
             "disk_name": d["disk_name"],
             "total_gb": d["total_gb"],
@@ -129,7 +164,7 @@ def build_metrics_payloads(client_id: str):
             "free_gb": d["free_gb"],
             "timestamp": ts,
 
-            # Extras (no rompe; el server los ignora si no los usa)
+            # Extras
             "iops": simulate_iops(),
             "mountpoint": d.get("mountpoint"),
             "percent": d.get("percent"),
@@ -140,13 +175,15 @@ def build_metrics_payloads(client_id: str):
 
 def connect_tcp(server_ip: str, server_port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(8)
+    sock.settimeout(8)  # timeout solo para conectar
     sock.connect((server_ip, server_port))
-    sock.settimeout(None)
+    sock.settimeout(None)  # luego queda en blocking normal
     return sock
 
 
-def run_client(client_id: str, server_ip: str, server_port: int, interval: int):
+def run_client(client_id: str, server_ip: str, server_port: int, interval: int, ack_timeout: int):
+    logger = setup_logger()
+
     backoff = 1
     max_backoff = 20
 
@@ -156,29 +193,49 @@ def run_client(client_id: str, server_ip: str, server_port: int, interval: int):
             try:
                 print(f"🔌 Conectando a {server_ip}:{server_port} ...")
                 sock = connect_tcp(server_ip, server_port)
+
                 print("✅ Conectado. Iniciando envío periódico...")
+                logger.info(f"Conexión exitosa al servidor {server_ip}:{server_port} | node_id={client_id}")
                 backoff = 1
 
                 while True:
                     payloads = build_metrics_payloads(client_id)
 
-                    # ✅ Enviar 1 payload por disco
+                    # Enviar 1 payload por disco
                     for payload in payloads:
                         send_json_lenpref(sock, payload)
                         print(f"📤 Enviado: {payload}")
 
-                        # Recibir ACK (opcional)
+                        # Esperar ACK con timeout (robusto)
                         try:
+                            sock.settimeout(ack_timeout)
                             ack = receive_json_lenpref(sock)
-                            if ack:
-                                print(f"✅ ACK: {ack}")
-                        except Exception:
-                            pass
+                            sock.settimeout(None)
+
+                            if not ack:
+                                raise ConnectionError("ACK vacío o conexión cerrada por el servidor")
+
+                            print(f"✅ ACK: {ack}")
+                            logger.info(
+                                f"ACK recibido | node_id={ack.get('node_id')} | disk={ack.get('disk_name')} | status={ack.get('status')}"
+                            )
+
+                        except socket.timeout:
+                            # ACK no llegó: tratamos como falla de comunicación
+                            sock.settimeout(None)
+                            logger.warning(f"Timeout esperando ACK ({ack_timeout}s). Se forzará reconexión.")
+                            raise ConnectionError(f"Timeout esperando ACK ({ack_timeout}s)")
+
+                        except Exception as e:
+                            sock.settimeout(None)
+                            logger.warning(f"Error recibiendo ACK. Se forzará reconexión. Detalle: {e}")
+                            raise
 
                     time.sleep(max(1, interval))
 
             except Exception as e:
                 print(f"❌ Error (se intentará reconectar): {e}")
+                logger.error(f"Error: {e} | Reintentando reconexión...")
 
             finally:
                 try:
@@ -188,23 +245,29 @@ def run_client(client_id: str, server_ip: str, server_port: int, interval: int):
                     pass
 
             print(f"🔁 Reintentando conexión en {backoff}s...")
+            logger.info(f"Reintentando conexión en {backoff}s...")
             time.sleep(backoff)
             backoff = min(max_backoff, backoff * 2)
 
     except KeyboardInterrupt:
         print("\n🛑 Cliente detenido por el usuario (Ctrl+C). Saliendo...")
+        logger.info("Cliente detenido por el usuario (Ctrl+C).")
 
 
 def main():
     args = parse_args()
+
     if args.interval <= 0:
         raise ValueError("--interval debe ser mayor a 0")
+    if args.ack_timeout <= 0:
+        raise ValueError("--ack-timeout debe ser mayor a 0")
 
     run_client(
         client_id=str(args.client_id),
         server_ip=args.server_ip,
-        server_port=args.server_port,
-        interval=args.interval,
+        server_port=int(args.server_port),
+        interval=int(args.interval),
+        ack_timeout=int(args.ack_timeout),
     )
 
 
