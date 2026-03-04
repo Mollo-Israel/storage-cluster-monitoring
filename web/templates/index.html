@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Storage Cluster Monitor</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>Storage Cluster Monitor</h1>
+      <div class="sub">Nodo central de monitoreo (9 clientes) · Auto-refresh configurable</div>
+    </div>
+
+    <div class="controls">
+      <label>
+        Refresh (s)
+        <input id="refreshSeconds" type="number" min="1" value="3"/>
+      </label>
+      <button id="applyRefresh">Aplicar</button>
+      <span id="statusDot" class="dot"></span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="card">
+      <h2>Totales del Cluster</h2>
+      <div id="totals" class="kpis">Cargando...</div>
+    </section>
+
+    <section class="card">
+      <h2>Nodos</h2>
+      <div class="table-wrap">
+        <table id="nodesTable">
+          <thead>
+            <tr>
+              <th>Nodo</th>
+              <th>Estado</th>
+              <th>Discos</th>
+              <th>Total (GB)</th>
+              <th>Usado (GB)</th>
+              <th>Libre (GB)</th>
+              <th>%</th>
+              <th>Uptime</th>
+              <th>Latencia (ms)</th>
+              <th>Growth (GB/día)</th>
+              <th>Avail %</th>
+              <th>Failover</th>
+            </tr>
+          </thead>
+          <tbody id="nodesBody"></tbody>
+        </table>
+      </div>
+      <p class="note">
+        Overcommit, Fragmentation y Replication health se muestran como N/A (no aplican en este cluster lógico de monitoreo).
+      </p>
+    </section>
+  </main>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
