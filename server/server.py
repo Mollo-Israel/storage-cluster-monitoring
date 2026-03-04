@@ -6,9 +6,10 @@ import sqlite3
 import struct
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple
 
 
 # =========================
@@ -103,10 +104,10 @@ def init_and_migrate_db(db_path: str) -> None:
             free_gb REAL NOT NULL,
             percent REAL,
             iops REAL,
-            uptime_sec INTEGER,         -- uptime del host
-            latency_ms REAL,            -- latencia server-side (aprox)
-            timestamp TEXT NOT NULL,     -- timestamp enviado por cliente
-            received_at TEXT NOT NULL,  -- timestamp servidor
+            uptime_sec INTEGER,
+            latency_ms REAL,
+            timestamp TEXT NOT NULL,     -- client timestamp (ISO)
+            received_at TEXT NOT NULL,   -- server rx timestamp (ISO)
             FOREIGN KEY(node_id) REFERENCES clients(node_id)
         );
         """
@@ -130,7 +131,6 @@ def init_and_migrate_db(db_path: str) -> None:
         """
     )
 
-    # Historial de estados (para Availability y Failover events)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS node_status_history (
@@ -144,12 +144,12 @@ def init_and_migrate_db(db_path: str) -> None:
 
     conn.commit()
 
-    # Migrations suaves para BD ya existente (ALTER TABLE si falta)
-    # metrics: disk_type, uptime_sec, latency_ms
     for col_def in [
         ("disk_type", "TEXT"),
         ("uptime_sec", "INTEGER"),
         ("latency_ms", "REAL"),
+        ("mountpoint", "TEXT"),
+        ("iops", "REAL"),
     ]:
         col, typ = col_def
         if not table_has_column(conn, "metrics", col):
@@ -162,7 +162,7 @@ def init_and_migrate_db(db_path: str) -> None:
 # =========================
 # Normalización de métricas
 # =========================
-def normalize_metric(message: dict) -> Tuple[bool, dict, str]:
+def normalize_metric(message: dict):
     node_id = message.get("node_id") or message.get("client_id")
     ts = message.get("timestamp")
     if not node_id or not ts:
@@ -209,7 +209,6 @@ def normalize_metric(message: dict) -> Tuple[bool, dict, str]:
     except Exception:
         uptime_sec = None
 
-    # Latencia aproximada: tiempo desde que el cliente mandó sent_at hasta que servidor procesó
     latency_ms = None
     try:
         if sent_at is not None:
@@ -266,7 +265,6 @@ class StorageClusterServer:
 
         self.db_lock = threading.Lock()
 
-    # ---------- DB ops ----------
     def _db(self) -> sqlite3.Connection:
         return get_db_conn(self.db_path)
 
@@ -312,10 +310,7 @@ class StorageClusterServer:
         with self.db_lock:
             conn = self._db()
             try:
-                conn.execute(
-                    "UPDATE clients SET last_seen=?, updated_at=? WHERE node_id=?;",
-                    (now, now, node_id),
-                )
+                conn.execute("UPDATE clients SET last_seen=?, updated_at=? WHERE node_id=?;", (now, now, node_id))
                 conn.commit()
             finally:
                 conn.close()
@@ -326,14 +321,9 @@ class StorageClusterServer:
             conn = self._db()
             try:
                 row = conn.execute("SELECT status FROM clients WHERE node_id=?;", (node_id,)).fetchone()
-                if not row:
+                if not row or row["status"] == "NO_REPORTA":
                     return
-                if row["status"] == "NO_REPORTA":
-                    return
-                conn.execute(
-                    "UPDATE clients SET status='NO_REPORTA', updated_at=? WHERE node_id=?;",
-                    (now, node_id),
-                )
+                conn.execute("UPDATE clients SET status='NO_REPORTA', updated_at=? WHERE node_id=?;", (now, node_id))
                 conn.execute(
                     "INSERT INTO node_status_history(node_id,status,changed_at) VALUES(?,?,?);",
                     (node_id, "NO_REPORTA", now),
@@ -372,134 +362,69 @@ class StorageClusterServer:
             finally:
                 conn.close()
 
-    # ---------- Watcher NO_REPORTA ----------
-    def watcher_no_reporta(self):
-        while self.running:
+    # ---------------- Commands queue/delivery ----------------
+    def fetch_pending_commands(self, node_id: str, limit: int = 5):
+        with self.db_lock:
+            conn = self._db()
             try:
-                cutoff = time.time() - self.no_report_timeout
-                # last_seen es ISO; comparamos parseando a epoch de forma simple
-                with self.db_lock:
-                    conn = self._db()
-                    try:
-                        rows = conn.execute("SELECT node_id, last_seen FROM clients;").fetchall()
-                    finally:
-                        conn.close()
+                rows = conn.execute(
+                    """
+                    SELECT cmd_id, action, value, message
+                    FROM commands
+                    WHERE node_id=? AND status='PENDING'
+                    ORDER BY created_at ASC
+                    LIMIT ?;
+                    """,
+                    (node_id, limit),
+                ).fetchall()
+                return [dict(r) for r in rows]
+            finally:
+                conn.close()
 
-                for r in rows:
-                    node_id = r["node_id"]
-                    try:
-                        # parse ISO -> epoch
-                        dt = datetime.fromisoformat(r["last_seen"])
-                        last_epoch = dt.timestamp()
-                    except Exception:
-                        continue
-
-                    if last_epoch < cutoff:
-                        self.set_client_no_reporta(node_id)
-
-            except Exception:
-                pass
-
-            time.sleep(2)
-
-    # ---------- Networking ----------
-    def start(self):
-        self.running = True
-        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_sock.bind((self.host, self.port))
-        self.server_sock.listen(50)
-
-        print(f"✅ Server escuchando en {self.host}:{self.port} | max_clients={self.max_clients}")
-        threading.Thread(target=self.watcher_no_reporta, daemon=True).start()
-
-        try:
-            while self.running:
-                client_sock, addr = self.server_sock.accept()
-                threading.Thread(target=self.handle_client, args=(client_sock, addr), daemon=True).start()
-        except KeyboardInterrupt:
-            print("\n🛑 Server detenido por usuario.")
-        finally:
-            self.running = False
+    def mark_command_sent(self, cmd_id: str):
+        with self.db_lock:
+            conn = self._db()
             try:
-                self.server_sock.close()
-            except Exception:
-                pass
-
-    def handle_client(self, client_sock: socket.socket, addr: Tuple[str, int]):
-        session = ClientSession(sock=client_sock, addr=addr, send_lock=threading.Lock(), node_id=None)
-        addr_str = f"{addr[0]}:{addr[1]}"
-
-        try:
-            while True:
-                msg = recv_json_lenpref(client_sock)
-                if msg is None:
-                    break
-
-                # ACK de comandos
-                if msg.get("type") == "CMD_ACK":
-                    self.handle_cmd_ack(msg)
-                    continue
-
-                if msg.get("type") == "INVALID_JSON":
-                    send_json_lenpref(client_sock, {"type": "ACK", "status": "ERROR", "message": "JSON inválido"}, session.send_lock)
-                    continue
-
-                ok, metric, err = normalize_metric(msg)
-                if not ok:
-                    send_json_lenpref(client_sock, {"type": "ACK", "status": "ERROR", "message": err}, session.send_lock)
-                    continue
-
-                node_id = metric["node_id"]
-
-                # Enforce max 9 clientes únicos
-                with self.sessions_lock:
-                    if node_id not in self.sessions and len(self.sessions) >= self.max_clients:
-                        send_json_lenpref(
-                            client_sock,
-                            {"type": "ACK", "status": "ERROR", "message": "Server lleno (max_clients alcanzado)"},
-                            session.send_lock,
-                        )
-                        continue
-
-                    # Registrar sesión (o actualizar)
-                    session.node_id = node_id
-                    self.sessions[node_id] = session
-
-                # Upsert cliente ACTIVE + last_seen
-                self.upsert_client_active(node_id=node_id, addr=addr_str)
-                self.touch_client_seen(node_id=node_id)
-
-                # Insert métrica
-                self.insert_metric(metric)
-
-                # Responder ACK
-                send_json_lenpref(
-                    client_sock,
-                    {
-                        "type": "ACK",
-                        "status": "OK",
-                        "message": "Métrica recibida",
-                        "node_id": node_id,
-                        "disk_name": metric["disk_name"],
-                    },
-                    session.send_lock,
+                conn.execute(
+                    "UPDATE commands SET status='SENT', sent_at=?, last_error=NULL WHERE cmd_id=?;",
+                    (now_iso(), cmd_id),
                 )
+                conn.commit()
+            finally:
+                conn.close()
 
-        except Exception:
-            pass
-        finally:
+    def mark_command_error(self, cmd_id: str, err: str):
+        with self.db_lock:
+            conn = self._db()
             try:
-                client_sock.close()
-            except Exception:
-                pass
+                conn.execute(
+                    "UPDATE commands SET status='ERROR', acked_at=?, last_error=? WHERE cmd_id=?;",
+                    (now_iso(), err[:500], cmd_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
-            # remover sesión
-            with self.sessions_lock:
-                if session.node_id and self.sessions.get(session.node_id) is session:
-                    del self.sessions[session.node_id]
+    def try_deliver_commands(self, session: ClientSession):
+        if not session.node_id:
+            return
+        pending = self.fetch_pending_commands(session.node_id)
+        for cmd in pending:
+            payload = {
+                "type": "COMMAND",
+                "cmd_id": cmd["cmd_id"],
+                "node_id": session.node_id,
+                "action": cmd["action"],
+                "value": cmd.get("value"),
+                "message": cmd.get("message"),
+                "sent_at": now_iso(),
+            }
+            try:
+                send_json_lenpref(session.sock, payload, session.send_lock)
+                self.mark_command_sent(cmd["cmd_id"])
+            except Exception as e:
+                self.mark_command_error(cmd["cmd_id"], f"send failed: {e}")
 
-    # ---------- Commands (simple, mantiene tu idea actual) ----------
     def handle_cmd_ack(self, msg: dict):
         cmd_id = str(msg.get("cmd_id", ""))
         node_id = str(msg.get("node_id", ""))
@@ -526,6 +451,126 @@ class StorageClusterServer:
                 conn.commit()
             finally:
                 conn.close()
+
+    # ---------------- watcher NO_REPORTA ----------------
+    def watcher_no_reporta(self):
+        while self.running:
+            try:
+                cutoff = time.time() - self.no_report_timeout
+                with self.db_lock:
+                    conn = self._db()
+                    try:
+                        rows = conn.execute("SELECT node_id, last_seen FROM clients;").fetchall()
+                    finally:
+                        conn.close()
+
+                for r in rows:
+                    node_id = r["node_id"]
+                    try:
+                        last_epoch = datetime.fromisoformat(r["last_seen"]).timestamp()
+                    except Exception:
+                        continue
+                    if last_epoch < cutoff:
+                        self.set_client_no_reporta(node_id)
+
+            except Exception:
+                pass
+            time.sleep(2)
+
+    # ---------------- networking ----------------
+    def start(self):
+        self.running = True
+        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_sock.bind((self.host, self.port))
+        self.server_sock.listen(50)
+        self.server_sock.settimeout(1.0)  # para salir limpio con Ctrl+C
+
+        print(f"✅ Server escuchando en {self.host}:{self.port} | max_clients={self.max_clients}")
+        threading.Thread(target=self.watcher_no_reporta, daemon=True).start()
+
+        try:
+            while self.running:
+                try:
+                    client_sock, addr = self.server_sock.accept()
+                except socket.timeout:
+                    continue
+                threading.Thread(target=self.handle_client, args=(client_sock, addr), daemon=True).start()
+        except KeyboardInterrupt:
+            print("\n🛑 Server detenido por usuario.")
+        finally:
+            self.running = False
+            try:
+                self.server_sock.close()
+            except Exception:
+                pass
+
+    def handle_client(self, client_sock: socket.socket, addr: Tuple[str, int]):
+        session = ClientSession(sock=client_sock, addr=addr, send_lock=threading.Lock(), node_id=None)
+        addr_str = f"{addr[0]}:{addr[1]}"
+
+        try:
+            while True:
+                msg = recv_json_lenpref(client_sock)
+                if msg is None:
+                    break
+
+                if msg.get("type") == "CMD_ACK":
+                    self.handle_cmd_ack(msg)
+                    continue
+
+                if msg.get("type") == "INVALID_JSON":
+                    send_json_lenpref(client_sock, {"type": "ACK", "status": "ERROR", "message": "JSON inválido"}, session.send_lock)
+                    continue
+
+                ok, metric, err = normalize_metric(msg)
+                if not ok:
+                    send_json_lenpref(client_sock, {"type": "ACK", "status": "ERROR", "message": err}, session.send_lock)
+                    continue
+
+                node_id = metric["node_id"]
+
+                with self.sessions_lock:
+                    if node_id not in self.sessions and len(self.sessions) >= self.max_clients:
+                        send_json_lenpref(
+                            client_sock,
+                            {"type": "ACK", "status": "ERROR", "message": "Server lleno (max_clients alcanzado)"},
+                            session.send_lock,
+                        )
+                        continue
+                    session.node_id = node_id
+                    self.sessions[node_id] = session
+
+                self.upsert_client_active(node_id=node_id, addr=addr_str)
+                self.touch_client_seen(node_id=node_id)
+
+                self.insert_metric(metric)
+
+                send_json_lenpref(
+                    client_sock,
+                    {
+                        "type": "ACK",
+                        "status": "OK",
+                        "message": "Métrica recibida",
+                        "node_id": node_id,
+                        "disk_name": metric["disk_name"],
+                    },
+                    session.send_lock,
+                )
+
+                # Intentar entregar comandos pendientes (después del ACK)
+                self.try_deliver_commands(session)
+
+        except Exception:
+            pass
+        finally:
+            try:
+                client_sock.close()
+            except Exception:
+                pass
+            with self.sessions_lock:
+                if session.node_id and self.sessions.get(session.node_id) is session:
+                    del self.sessions[session.node_id]
 
 
 def parse_args():

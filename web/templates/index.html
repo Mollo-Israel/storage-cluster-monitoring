@@ -8,29 +8,52 @@
 </head>
 <body>
   <header class="topbar">
-    <div>
-      <h1>Storage Cluster Monitor</h1>
-      <div class="sub">Nodo central de monitoreo (9 clientes) · Auto-refresh configurable</div>
+    <div class="brand">
+      <div class="logo">CNS</div>
+      <div>
+        <div class="title">Monitor nacional de almacenamiento</div>
+        <div class="sub">Nodo central (9 clientes) · Auto-refresh configurable · Commands (bidireccional)</div>
+      </div>
     </div>
 
     <div class="controls">
-      <label>
+      <label class="ctrl">
         Refresh (s)
         <input id="refreshSeconds" type="number" min="1" value="3"/>
       </label>
       <button id="applyRefresh">Aplicar</button>
+      <button id="pauseRefresh" class="ghost">Pausar</button>
       <span id="statusDot" class="dot"></span>
+      <span id="lastUpdate" class="last">—</span>
     </div>
   </header>
 
-  <main class="grid">
-    <section class="card">
-      <h2>Totales del Cluster</h2>
+  <main class="page">
+    <!-- KPIs globales -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Totales del Cluster</h2>
+        <div class="panel-meta" id="clusterMeta">—</div>
+      </div>
       <div id="totals" class="kpis">Cargando...</div>
     </section>
 
-    <section class="card">
-      <h2>Nodos</h2>
+    <!-- Cards tipo datacenter -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Regionales</h2>
+        <div class="panel-meta">Click en una tarjeta para ver discos, histórico y enviar comandos.</div>
+      </div>
+      <div id="nodesCards" class="cards">Cargando...</div>
+    </section>
+
+    <!-- Tabla (útil para defensa) -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Detalle por Nodo</h2>
+        <div class="panel-meta">Vista tabular para revisión rápida.</div>
+      </div>
+
       <div class="table-wrap">
         <table id="nodesTable">
           <thead>
@@ -38,25 +61,140 @@
               <th>Nodo</th>
               <th>Estado</th>
               <th>Discos</th>
-              <th>Total (GB)</th>
-              <th>Usado (GB)</th>
-              <th>Libre (GB)</th>
+              <th>Total</th>
+              <th>Usado</th>
+              <th>Libre</th>
               <th>%</th>
               <th>Uptime</th>
-              <th>Latencia (ms)</th>
-              <th>Growth (GB/día)</th>
+              <th>Lat (ms)</th>
+              <th>Growth (GB/mes)</th>
               <th>Avail %</th>
               <th>Failover</th>
+              <th>Skew (ms)</th>
             </tr>
           </thead>
           <tbody id="nodesBody"></tbody>
         </table>
       </div>
-      <p class="note">
-        Overcommit, Fragmentation y Replication health se muestran como N/A (no aplican en este cluster lógico de monitoreo).
-      </p>
+
+      <p class="note">Overcommit / Fragmentation / Replication health: N/A (no aplican en este cluster lógico de monitoreo).</p>
     </section>
   </main>
+
+  <!-- MODAL DETALLE -->
+  <div id="modalBackdrop" class="modal-backdrop hidden"></div>
+  <div id="nodeModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <div>
+        <div id="modalTitle" class="modal-title">Nodo</div>
+        <div id="modalSub" class="modal-sub">—</div>
+      </div>
+      <button id="closeModal" class="icon-btn" title="Cerrar">✕</button>
+    </div>
+
+    <div class="modal-body">
+      <div class="modal-grid">
+        <div class="mini">
+          <div class="mini-k">Capacidad</div>
+          <div id="mTotal" class="mini-v">—</div>
+        </div>
+        <div class="mini">
+          <div class="mini-k">Uso</div>
+          <div id="mUsed" class="mini-v">—</div>
+        </div>
+        <div class="mini">
+          <div class="mini-k">Libre</div>
+          <div id="mFree" class="mini-v">—</div>
+        </div>
+        <div class="mini">
+          <div class="mini-k">% Utilización</div>
+          <div id="mPct" class="mini-v">—</div>
+        </div>
+      </div>
+
+      <div class="split">
+        <div class="cardish">
+          <div class="block-title">Discos (último snapshot)</div>
+          <div class="table-wrap">
+            <table class="mini-table">
+              <thead>
+                <tr>
+                  <th>Disco</th>
+                  <th>Mount</th>
+                  <th>Tipo</th>
+                  <th>Total</th>
+                  <th>Usado</th>
+                  <th>Libre</th>
+                  <th>%</th>
+                  <th>IOPS</th>
+                  <th>Client TS</th>
+                  <th>Server RX</th>
+                </tr>
+              </thead>
+              <tbody id="disksBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="cardish">
+          <div class="block-title">Histórico (Uso disco total)</div>
+          <div class="history-wrap">
+            <div class="history-table">
+              <table class="mini-table">
+                <thead>
+                  <tr>
+                    <th>Fecha</th>
+                    <th>Uso disco (TB)</th>
+                  </tr>
+                </thead>
+                <tbody id="histTableBody"></tbody>
+              </table>
+            </div>
+
+            <div class="history-chart">
+              <canvas id="historyChart" width="620" height="260"></canvas>
+              <div class="chart-note" id="chartNote">—</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="cardish">
+        <div class="block-title">Enviar comando al nodo</div>
+        <div class="cmd-row">
+          <select id="cmdAction">
+            <option value="SHOW_MESSAGE">SHOW_MESSAGE</option>
+            <option value="SET_INTERVAL">SET_INTERVAL</option>
+            <option value="PING">PING</option>
+          </select>
+
+          <input id="cmdValue" placeholder="value (opcional, ej: 10 para SET_INTERVAL)" />
+          <input id="cmdMessage" placeholder='message (ej: "Verifique espacio en disco")' />
+          <button id="sendCmd">Enviar</button>
+        </div>
+        <div id="cmdStatus" class="cmd-status">—</div>
+
+        <div class="block-title" style="margin-top:12px;">Últimos comandos</div>
+        <div class="table-wrap">
+          <table class="mini-table">
+            <thead>
+              <tr>
+                <th>cmd_id</th>
+                <th>action</th>
+                <th>value</th>
+                <th>message</th>
+                <th>status</th>
+                <th>created</th>
+                <th>acked</th>
+                <th>error</th>
+              </tr>
+            </thead>
+            <tbody id="cmdsBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <script src="/static/dashboard.js"></script>
 </body>
