@@ -9,10 +9,11 @@ import json
 import urllib.request
 
 APP_TITLE = "Storage Client - Control (CNS) - Robust"
-SERVER_IP_FIXED = "127.0.0.1"
+
+# Puerto del servidor TCP (tu server.py)
 SERVER_PORT = 5000
 
-WEB_HOST = "127.0.0.1"
+# Puerto del web/app.py (API /api/nodes) en el servidor
 WEB_PORT = 8000
 
 DEPARTAMENTOS = [
@@ -27,52 +28,24 @@ DEPARTAMENTOS = [
     ("Potosí", "PTS"),
 ]
 
-def now_hms():
+
+def now_hms() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
-def py_executable():
+
+def py_executable() -> str:
     return sys.executable
 
-def script_dir():
+
+def script_dir() -> str:
+    # Carpeta donde está gui_client.py
     return os.path.dirname(os.path.abspath(__file__))
 
-def client_script_path():
+
+def client_script_path() -> str:
+    # client.py está en el mismo directorio client/
     return os.path.join(script_dir(), "client.py")
 
-def fetch_nodes(timeout_sec: float = 2.0):
-    url = f"http://{WEB_HOST}:{WEB_PORT}/api/nodes"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout_sec) as resp:
-            raw = resp.read().decode("utf-8", errors="ignore")
-            return json.loads(raw)
-    except Exception:
-        return None
-
-def active_node_ids():
-    nodes = fetch_nodes()
-    if nodes is None:
-        return None
-    active = set()
-    for n in nodes:
-        if str(n.get("status", "")).upper() == "ACTIVE":
-            active.add(str(n.get("node_id", "")))
-    return active
-
-def client_supports_flag(flag: str) -> bool:
-    try:
-        p = subprocess.run(
-            [py_executable(), client_script_path(), "--help"],
-            cwd=script_dir(),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            timeout=3.0
-        )
-        out = (p.stdout or "") + (p.stderr or "")
-        return flag in out
-    except Exception:
-        return False
 
 def decode_line(b: bytes) -> str:
     """
@@ -87,7 +60,37 @@ def decode_line(b: bytes) -> str:
     return b.decode("latin-1", errors="replace")
 
 
+def fetch_nodes(server_ip: str, timeout_sec: float = 2.0):
+    """
+    Consulta /api/nodes en el servidor indicado.
+    Si no está levantado web/app.py en ese host, devuelve None.
+    """
+    url = f"http://{server_ip}:{WEB_PORT}/api/nodes"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+            return json.loads(raw)
+    except Exception:
+        return None
+
+
+def active_node_ids(server_ip: str):
+    """
+    Devuelve set de node_id activos según /api/nodes (si está disponible).
+    Si no hay web, devuelve None.
+    """
+    nodes = fetch_nodes(server_ip)
+    if nodes is None:
+        return None
+    active = set()
+    for n in nodes:
+        if str(n.get("status", "")).upper() == "ACTIVE":
+            active.add(str(n.get("node_id", "")))
+    return active
+
+
 class ClientGUI(tk.Tk):
+    # Para evitar correr el mismo ID dos veces en la MISMA PC
     LOCAL_RUNNING = set()
 
     def __init__(self):
@@ -101,7 +104,6 @@ class ClientGUI(tk.Tk):
         self.stop_read = False
         self.running_node_id = None
 
-        self._flag_first_disk_supported = None
         self._build_ui()
 
     def _build_ui(self):
@@ -114,33 +116,28 @@ class ClientGUI(tk.Tk):
             top,
             state="readonly",
             width=30,
-            values=[f"{n} ({i})" for n, i in DEPARTAMENTOS]
+            values=[f"{n} ({i})" for n, i in DEPARTAMENTOS],
         )
         self.combo.current(0)
         self.combo.grid(row=0, column=1, sticky="w")
 
-        ttk.Label(top, text="Server IP (fijo):").grid(row=1, column=0, sticky="w")
-        ttk.Label(top, text=SERVER_IP_FIXED).grid(row=1, column=1, sticky="w")
+        # Server IP configurable (LAN)
+        ttk.Label(top, text="Server IP (LAN):").grid(row=1, column=0, sticky="w")
+        self.server_ip_var = tk.StringVar(value="127.0.0.1")
+        ttk.Entry(top, textvariable=self.server_ip_var, width=18).grid(row=1, column=1, sticky="w")
 
         ttk.Label(top, text="Intervalo (s):").grid(row=2, column=0, sticky="w")
         self.int_var = tk.StringVar(value="5")
         ttk.Entry(top, textvariable=self.int_var, width=10).grid(row=2, column=1, sticky="w")
 
-        self.first_only_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="Reportar solo 1 disco (compatibilidad)", variable=self.first_only_var)\
-            .grid(row=3, column=1, sticky="w")
-
         btns = ttk.Frame(top)
-        btns.grid(row=4, column=1, sticky="w", pady=(6, 0))
+        btns.grid(row=3, column=1, sticky="w", pady=(6, 0))
 
         self.start_btn = ttk.Button(btns, text="Conectar / Iniciar", command=self.start_client)
         self.start_btn.pack(side="left", padx=(0, 10))
 
         self.stop_btn = ttk.Button(btns, text="Detener", command=self.stop_client, state="disabled")
         self.stop_btn.pack(side="left", padx=(0, 10))
-
-        self.test_btn = ttk.Button(btns, text="Test /api/nodes", command=self.test_api_nodes)
-        self.test_btn.pack(side="left")
 
         ttk.Separator(self).pack(fill="x", padx=12, pady=10)
 
@@ -168,21 +165,23 @@ class ClientGUI(tk.Tk):
             raise ValueError("No hay departamento seleccionado.")
         return DEPARTAMENTOS[idx][1]
 
-    def test_api_nodes(self):
-        nodes = fetch_nodes()
-        if nodes is None:
-            messagebox.showerror("API", f"No responde http://{WEB_HOST}:{WEB_PORT}/api/nodes\n¿Está levantado web/app.py?")
-            return
-        active = [n.get("node_id") for n in nodes if str(n.get("status","")).upper() == "ACTIVE"]
-        messagebox.showinfo("API OK", f"API responde.\nActivos: {active}")
+    def _get_server_ip(self) -> str:
+        ip = self.server_ip_var.get().strip()
+        if not ip:
+            raise ValueError("Server IP no puede estar vacío.")
+        if " " in ip or "/" in ip:
+            raise ValueError("Server IP inválido.")
+        return ip
 
     def start_client(self):
+        # Si ya hay proceso vivo
         if self.proc and self.proc.poll() is None:
             messagebox.showwarning("Cliente", "Este cliente ya está en ejecución.")
             return
 
         try:
             node_id = self.selected_node_id()
+            server_ip = self._get_server_ip()
         except Exception as e:
             messagebox.showerror("Error", str(e))
             return
@@ -192,49 +191,46 @@ class ClientGUI(tk.Tk):
             messagebox.showerror("Datos inválidos", "Intervalo debe ser número entero > 0.")
             return
 
+        # Evitar duplicado local
         if node_id in ClientGUI.LOCAL_RUNNING:
             messagebox.showerror("Nodo ocupado", f"El nodo {node_id} ya está ejecutándose en esta PC.\nElige otro.")
             return
 
-        act = active_node_ids()
+        # Chequeo en servidor si la API está disponible
+        act = active_node_ids(server_ip)
         if act is not None and node_id in act:
             messagebox.showerror("Nodo ocupado", f"El nodo {node_id} ya está ACTIVO en el servidor.\nElige otro.")
             return
 
-        if self._flag_first_disk_supported is None:
-            self._flag_first_disk_supported = client_supports_flag("--first-disk-only")
-
         cmd = [
             py_executable(),
             client_script_path(),
-            "--client-id", node_id,
-            "--server-ip", SERVER_IP_FIXED,
-            "--server-port", str(SERVER_PORT),
-            "--interval", interval
+            "--client-id",
+            node_id,
+            "--server-ip",
+            server_ip,
+            "--server-port",
+            str(SERVER_PORT),
+            "--interval",
+            interval,
         ]
-
-        if self.first_only_var.get():
-            if self._flag_first_disk_supported:
-                cmd.append("--first-disk-only")
-            else:
-                self.append_log(f"[{now_hms()}] ⚠️ client.py no soporta --first-disk-only. Se ignorará.\n")
 
         try:
             self.running_node_id = node_id
             ClientGUI.LOCAL_RUNNING.add(node_id)
 
-            self.append_log(f"\n[{now_hms()}] Iniciando nodo={node_id} ip={SERVER_IP_FIXED} interval={interval}\n")
+            self.append_log(f"\n[{now_hms()}] Iniciando nodo={node_id} ip={server_ip} interval={interval}\n")
             self.append_log(f"[CMD] {' '.join(cmd)}\n")
 
             self.stop_read = False
 
-            # 👇 IMPORTANTE: text=False para leer BYTES y decodificar con fallback
+            # Leer bytes para decodificar robusto
             self.proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=False,
-                bufsize=1,
+                bufsize=0,
                 cwd=script_dir(),
             )
 
@@ -255,19 +251,26 @@ class ClientGUI(tk.Tk):
             while True:
                 if self.stop_read:
                     break
+                if not self.proc or not self.proc.stdout:
+                    break
+
                 b = self.proc.stdout.readline()
                 if not b:
                     break
+
                 line = decode_line(b)
                 self.after(0, self.append_log, line)
+
         except Exception as e:
             self.after(0, self.append_log, f"\n[{now_hms()}] [ERROR leyendo salida] {e}\n")
         finally:
             code = None
             try:
-                code = self.proc.poll()
+                if self.proc:
+                    code = self.proc.poll()
             except Exception:
                 pass
+
             self.after(0, self.append_log, f"\n[{now_hms()}] Proceso terminó. code={code}\n")
             self.after(0, self._unlock_buttons)
 
@@ -302,5 +305,6 @@ if __name__ == "__main__":
         style.theme_use("clam")
     except Exception:
         pass
+
     app = ClientGUI()
     app.mainloop()
